@@ -1,0 +1,7 @@
+TEAM_ID=
+
+PRODUCT_NAME=OverseersTerminal
+PRODUCT_BUNDLE_IDENTIFIER=com.dravenmiller.overseersterminal.OverseersTerminal$(TEAM_ID)
+
+CURRENT_PROJECT_VERSION=1
+MARKETING_VERSION=1.0

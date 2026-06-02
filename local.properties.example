@@ -1,0 +1,9 @@
+# Overseer's Terminal - Example Local Properties
+# Rename this file to 'local.properties' and replace the dummy values with your actual keys.
+
+# System API Keys
+WEATHER_API_KEY=insert_your_api_key_here
+MAPS_SDK_KEY=insert_your_maps_key_here
+
+# Directory Paths (if needed)
+sdk.dir=/Users/Username/Library/Android/sdk
