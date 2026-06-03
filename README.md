@@ -1,4 +1,4 @@
-## Screenshots
+## Overseer's Terminal
 
 <p align="center">
   <img src="screenshots/stat.jpg" width="900" alt="STAT screen showing HP, AP, and animated Vault Boy status display">
