@@ -1,5 +1,6 @@
 package com.dravenmiller.overseersterminal.ui.tabs
 
+import LocalAuthBridge
 import PipPicker
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -12,9 +13,14 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Autorenew
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material3.Button
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -29,9 +35,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.dravenmiller.overseersterminal.AuthHolder
+import com.dravenmiller.overseersterminal.GoogleAuthBridge
 import com.dravenmiller.overseersterminal.components.*
 import com.dravenmiller.overseersterminal.theme.ThemeController
 import kotlinx.coroutines.delay
+import com.dravenmiller.overseersterminal.CalendarEvent
+import com.dravenmiller.overseersterminal.CalendarProcessor
 
 @Composable
 fun QuestsSubTab(themeController: ThemeController) {
@@ -41,6 +51,8 @@ fun QuestsSubTab(themeController: ThemeController) {
     var showCreateQuest by rememberSaveable { mutableStateOf(false) }
     var showAddObjectiveTo by rememberSaveable { mutableStateOf<String?>(null) }
     var showCompletionPromptFor by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val authBridge = LocalAuthBridge.current
 
     // Tracks which Quest ID and Objective Index to add funds to!
     var showAppendFundsFor by rememberSaveable { mutableStateOf<Pair<String, Int>?>(null) }
@@ -71,6 +83,7 @@ fun QuestsSubTab(themeController: ThemeController) {
 
                 PipText("[ + INITIALIZE NEW QUEST ]", themeController = themeController, fontSize = 14.sp, modifier = Modifier.fillMaxWidth().clickable { showCreateQuest = true }.padding(bottom = 16.dp))
 
+                Spacer(modifier     = Modifier.height(16.dp))
                 LazyColumn {
                     val currentTime = getSystemEpochMillis()
                     val visibleActive = QuestEngine.activeQuests.filter { !it.isComplete && it.spawnTimeMs <= currentTime }
@@ -122,22 +135,31 @@ fun QuestsSubTab(themeController: ThemeController) {
                     }
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // THE CASCADING REVEALER
+                    // THE PHASE REVEALER
                     val visibleObjectives = mutableListOf<Pair<Int, Objective>>()
-                    var hideRemaining = false // Acts as a tripwire
+                    var hideRemaining = false
+                    var currentGroupIncomplete = false
 
                     for (i in selectedQuest.objectives.indices) {
                         val obj = selectedQuest.objectives[i]
 
-                        // If the tripwire was hit by an earlier objective, AND this objective is told to wait, stop loading!
-                        if (hideRemaining && obj.waitForPrevious) break
+                        // If this item starts a new phase, check if the previous phase was finished!
+                        if (obj.waitForPrevious) {
+                            if (currentGroupIncomplete) hideRemaining = true
+                            currentGroupIncomplete = false // Reset for the new phase
+                        }
+
+                        if (hideRemaining) continue // Skips rendering future locked phases
 
                         visibleObjectives.add(i to obj)
 
-                        // If THIS objective isn't done, it trips the wire for everything below it!
-                        if (!obj.isComplete) hideRemaining = true
+                        // If anything mandatory in this phase is incomplete, it flags the phase as unfinished
+                        if (!obj.isComplete && !obj.isOptional) {
+                            currentGroupIncomplete = true
+                        }
                     }
                     visibleObjectives.reverse() // Keep the newest active step at the top
+
 
                     LazyColumn(modifier = Modifier.weight(1f)) {
                         items(visibleObjectives.size) { index ->
@@ -185,12 +207,14 @@ fun QuestsSubTab(themeController: ThemeController) {
                             }.padding(8.dp)) {
 
                                 // THE DYNAMIC TEXT
+                                val optTag = if (objective.isOptional) "[OPTIONAL] " else ""
+
                                 if (isTimerLocked) {
-                                    PipText("[ CHECK STATUS: $timerDisplay ]", themeController, fontSize = 16.sp, modifier = Modifier.alpha(0.8f))
+                                    PipText("$optTag[ CHECK STATUS: $timerDisplay ]", themeController, fontSize = 16.sp, modifier = Modifier.alpha(0.8f))
                                 } else if (objective.type == ObjectiveType.TIMED_WAIT && objective.postWaitText != null) {
-                                    PipText(objective.postWaitText, themeController, fontSize = 16.sp, modifier = if (objective.isComplete) Modifier.alpha(0.5f) else Modifier)
+                                    PipText("$optTag${objective.postWaitText}", themeController, fontSize = 16.sp, modifier = if (objective.isComplete) Modifier.alpha(0.5f) else Modifier)
                                 } else {
-                                    PipText(objective.text, themeController, fontSize = 16.sp, modifier = if (objective.isComplete) Modifier.alpha(0.5f) else Modifier)
+                                    PipText("$optTag${objective.text}", themeController, fontSize = 16.sp, modifier = if (objective.isComplete) Modifier.alpha(0.5f) else Modifier)
                                 }
 
                                 // COLLECTION BAR
@@ -231,21 +255,32 @@ fun QuestsSubTab(themeController: ThemeController) {
         // --- LAYER 2: THE TERMINAL OVERLAYS ---
         if (showCreateQuest) {
             CreateQuestTerminal(themeController, onCancel = { showCreateQuest = false },
-                onSave = { title, category, objectives, repeatInt, saveTemp ->
-                    QuestEngine.createNewQuest(title, category, objectives, repeatInt, saveTemp)
+                onSave = { title, category, repeatInt, saveTemp, isSeq ->
+                    // 1. Create the empty quest and grab the ID
+                    val newId = QuestEngine.createNewQuest(title, category, repeatInt, saveTemp, isSeq)
                     showCreateQuest = false
+
+                    // 2. Select it in the background list
+                    selectedQuestId = newId
+
+                    // 3. THE WIZARD CHAIN: Instantly open the objective terminal!
+                    showAddObjectiveTo = newId
                 }
             )
         }
 
         if (showAddObjectiveTo != null) {
-            AddObjectiveTerminal(themeController, onCancel = { showAddObjectiveTo = null },
+            AddObjectiveTerminal(
+                questId = showAddObjectiveTo!!, // THE FIX: We pass the ID in so it can read the list!
+                themeController = themeController,
+                onCancel = { showAddObjectiveTo = null },
                 onSave = { objectives ->
                     QuestEngine.addObjectives(showAddObjectiveTo!!, objectives)
                     showAddObjectiveTo = null
                 }
             )
         }
+
 
         if (showAppendFundsFor != null) {
             AppendFundsTerminal(themeController, onCancel = { showAppendFundsFor = null },
@@ -279,17 +314,19 @@ fun QuestsSubTab(themeController: ThemeController) {
 // =========================================================================
 
 @Composable
-fun CreateQuestTerminal(themeController: ThemeController, onCancel: () -> Unit, onSave: (String, QuestCategory, List<Objective>, String?, Boolean) -> Unit) {
+fun CreateQuestTerminal(themeController: ThemeController, onCancel: () -> Unit, onSave: (String, QuestCategory, String?, Boolean, Boolean) -> Unit) {
     var title by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf(QuestCategory.MAIN) }
     var saveAsTemplate by remember { mutableStateOf(false) }
+    var isSequential by remember { mutableStateOf(true) }
 
     var repeatNum by remember { mutableStateOf("1") }
     val units = listOf("DAYS", "WEEKS", "MONTHS", "YEARS")
     var unitIndex by remember { mutableStateOf(1) }
-
-    var currentObjText by remember { mutableStateOf("") }
-    val queuedObjectives = remember { mutableStateListOf<Objective>() }
+    // Holds the data from Google
+    var importedEvents by remember { mutableStateOf<List<CalendarEvent>>(emptyList()) }
+    // Shows a loading state
+    var isFetching by remember { mutableStateOf(false) }
 
     Dialog(onDismissRequest = { onCancel() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.95f)).imePadding(), contentAlignment = Alignment.Center) {
@@ -297,11 +334,11 @@ fun CreateQuestTerminal(themeController: ThemeController, onCancel: () -> Unit, 
 
             Column(modifier = Modifier.fillMaxSize().border(2.dp, themeController.activeColor).background(Color.Black).padding(16.dp).verticalScroll(scrollState)) {
                 PipText(">>> ESTABLISH NEW DIRECTIVE <<<", themeController, fontSize = 20.sp)
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(16.dp))
 
                 BasicTextField(value = title, onValueChange = { title = it }, textStyle = TextStyle(color = themeController.activeColor, fontSize = 20.sp), cursorBrush = SolidColor(themeController.activeColor), modifier = Modifier.fillMaxWidth().background(themeController.activeColor.copy(alpha = 0.1f)).padding(8.dp), decorationBox = { inner -> if (title.isEmpty()) PipText("QUEST DESIGNATION...", themeController, modifier = Modifier.alpha(0.5f)) else inner() })
 
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(24.dp))
                 PipText("CATEGORY CLASSIFICATION:", themeController, fontSize = 14.sp)
                 Spacer(Modifier.height(8.dp))
 
@@ -335,37 +372,88 @@ fun CreateQuestTerminal(themeController: ThemeController, onCancel: () -> Unit, 
                     }
                 }
 
-                Spacer(Modifier.height(16.dp))
-                Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(themeController.activeColor))
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(24.dp))
 
-                BasicTextField(value = currentObjText, onValueChange = { currentObjText = it }, textStyle = TextStyle(color = themeController.activeColor, fontSize = 16.sp), cursorBrush = SolidColor(themeController.activeColor), modifier = Modifier.fillMaxWidth().background(themeController.activeColor.copy(alpha = 0.1f)).padding(8.dp), decorationBox = { inner -> if (currentObjText.isEmpty()) PipText("ADD OBJECTIVE / GROCERY ITEM...", themeController, modifier = Modifier.alpha(0.5f)) else inner() })
+                // 1. NEW PLACEMENT: Put the Transmissions List HERE, before the bottom buttons!
+                if (importedEvents.isNotEmpty()) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        PipText(
+                            "--- INCOMING TRANSMISSIONS ---",
+                            themeController,
+                            fontSize = 12.sp,
+                            modifier = Modifier.alpha(0.8f).padding(bottom = 8.dp)
+                        )
 
-                Spacer(Modifier.height(8.dp))
-                PipText("[ QUEUE OBJECTIVE ]", themeController, modifier = Modifier.align(Alignment.End).clickable {
-                    if (currentObjText.isNotBlank()) {
-                        queuedObjectives.add(Objective(text = currentObjText))
-                        currentObjText = ""
+                        // Draw each event
+                        importedEvents.forEach { event ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // The Event Title
+                                PipText(
+                                    ">> ${event.title}",
+                                    themeController,
+                                    fontSize = 14.sp,
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                                )
+
+                                // The Action Button
+                                PipText(
+                                    text = "[ CONVERT ]",
+                                    themeController = themeController,
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.border(1.dp, themeController.activeColor)
+                                        .clickable {
+                                            // Auto-fill the Quest Title box!
+                                            title = event.title
+                                        }.padding(4.dp)
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(themeController.activeColor.copy(alpha = 0.3f)))
+                        Spacer(Modifier.height(16.dp))
                     }
-                })
-
-                if (queuedObjectives.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    queuedObjectives.forEach { obj -> PipText("> ${obj.text}", themeController, fontSize = 12.sp) }
                 }
 
-                Spacer(Modifier.height(24.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    PipText(if (saveAsTemplate) "[☑] SAVE TEMPLATE" else "[ ] SAVE TEMPLATE", themeController, fontSize = 12.sp, modifier = Modifier.clickable { saveAsTemplate = !saveAsTemplate })
+                // 2. THE BOTTOM ACTION ROW (Keep this isolated!)
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                    Column {
+                        PipText(if (saveAsTemplate) "[☑] SAVE TEMPLATE" else "[ ] SAVE TEMPLATE", themeController, fontSize = 12.sp, modifier = Modifier.clickable { saveAsTemplate = !saveAsTemplate })
+                        Spacer(Modifier.height(8.dp))
+                        SyncButton(themeController)
+                        Spacer(Modifier.height(8.dp))
+                        PipText(
+                            text = if (isFetching) "[ ESTABLISHING UPLINK... ]" else "[ FETCH CALENDAR DATA ]",
+                            themeController = themeController,
+                            textColorOverride = Color.Black,
+                            modifier = Modifier
+                                .background(themeController.activeColor)
+                                .clickable {
+                                    if (isFetching) return@clickable
+                                    isFetching = true
+
+                                    AuthHolder.bridge.value?.fetchUpcomingEvents { events ->
+                                        isFetching = false
+                                        if (events != null) {
+                                            importedEvents = events
+                                            println("Fetched ${events.size} events!")
+                                        } else {
+                                            println("Uplink failed.")
+                                        }
+                                    }
+                                }
+                                .padding(8.dp)
+                        )
+                    }
 
                     Row {
                         PipText("[ CANCEL ]", themeController, modifier = Modifier.clickable { onCancel() }.padding(8.dp))
                         PipText("[ INITIALIZE ]", themeController, textColorOverride = Color.Black, modifier = Modifier.background(themeController.activeColor).clickable {
-                            val finalObjectives = queuedObjectives.toMutableList()
-                            if (currentObjText.isNotBlank()) finalObjectives.add(Objective(text = currentObjText))
-                            if (title.isNotBlank() && finalObjectives.isNotEmpty()) {
+                            if (title.isNotBlank()) {
                                 val finalInterval = if (selectedCategory == QuestCategory.RADIANT) "$repeatNum ${units[unitIndex]}" else null
-                                onSave(title, selectedCategory, finalObjectives, finalInterval, saveAsTemplate)
+                                onSave(title, selectedCategory, finalInterval, saveAsTemplate, isSequential)
                             }
                         }.padding(8.dp))
                     }
@@ -375,25 +463,42 @@ fun CreateQuestTerminal(themeController: ThemeController, onCancel: () -> Unit, 
     }
 }
 
-@Composable
-fun AddObjectiveTerminal(themeController: ThemeController, onCancel: () -> Unit, onSave: (List<Objective>) -> Unit) {
-    var text by remember { mutableStateOf("") }
 
-    // THE FIX: The list order now perfectly matches the Engine Enum!
-    // 0 = STANDARD, 1 = TIMED_WAIT, 2 = COLLECTION
+@Composable
+fun AddObjectiveTerminal(questId: String, themeController: ThemeController, onCancel: () -> Unit, onSave: (List<Objective>) -> Unit) {
+    val existingObjectives = QuestEngine.activeQuests.find { it.id == questId }?.objectives ?: emptyList()
+
+    var text by remember { mutableStateOf("") }
     val objTypes = listOf("STANDARD", "TIMED WAIT", "COLLECTION")
     var selectedTypeIndex by remember { mutableStateOf(0) }
-
     var targetAmount by remember { mutableStateOf("") }
+    var isCurrency by remember { mutableStateOf(true) }
     var waitTime by remember { mutableStateOf("") }
     val timeUnits = listOf("MINUTES", "HOURS", "DAYS")
     var timeUnitIndex by remember { mutableStateOf(0) }
     var postWaitText by remember { mutableStateOf("") }
-    var isCurrency by remember { mutableStateOf(false) }
-
     var waitForPrevious by remember { mutableStateOf(true) }
-
+    var isOptional by remember { mutableStateOf(false) } // <-- NEW TOGGLE STATE
     val queued = remember { mutableStateListOf<Objective>() }
+
+    // --- LIVE PHASE CALCULATOR ---
+    val combinedList = existingObjectives + queued
+    var latestPhase = 1
+    val phaseMap = mutableMapOf<String, Int>() // Maps Objective IDs to their Phase #
+
+    for (i in combinedList.indices) {
+        val obj = combinedList[i]
+        if (i > 0 && obj.waitForPrevious) latestPhase++
+        phaseMap[obj.id] = latestPhase
+    }
+    val pendingPhaseNum = if (combinedList.isEmpty()) 1 else if (waitForPrevious) latestPhase + 1 else latestPhase
+
+    // --- NISKA'S EMOJI HELPER ---
+    fun getEmoji(type: ObjectiveType): String = when(type) {
+        ObjectiveType.TIMED_WAIT -> " ⏳"
+        ObjectiveType.COLLECTION -> " 💰"
+        ObjectiveType.STANDARD -> ""
+    }
 
     Dialog(onDismissRequest = { onCancel() }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.95f)).imePadding(), contentAlignment = Alignment.Center) {
@@ -403,25 +508,69 @@ fun AddObjectiveTerminal(themeController: ThemeController, onCancel: () -> Unit,
                 PipText(">>> APPEND OBJECTIVE LOG <<<", themeController, fontSize = 20.sp)
                 Spacer(Modifier.height(16.dp))
 
+                // PHASE-SEPARATED OBJECTIVE DISPLAY
+                if (existingObjectives.isNotEmpty()) {
+                    val pastObjs = mutableListOf<Objective>()
+                    val currentObjs = mutableListOf<Objective>()
+                    val futureObjs = mutableListOf<Objective>()
+                    var hideRem = false
+                    var grpInc = false
+
+                    existingObjectives.forEach { obj ->
+                        if (obj.waitForPrevious) {
+                            if (grpInc) hideRem = true
+                            grpInc = false
+                        }
+                        if (hideRem) futureObjs.add(obj) else if (obj.isComplete) pastObjs.add(obj) else { currentObjs.add(obj); if (!obj.isOptional) grpInc = true }
+                    }
+
+                    // DRAWS THE CATEGORIES USING THE NEW IMMERSIVE ICONS
+                    if (pastObjs.isNotEmpty()) {
+                        PipText("--- PAST OBJECTIVES ---", themeController, fontSize = 12.sp, modifier = Modifier.alpha(0.5f))
+                        pastObjs.forEach { obj -> ObjectiveDisplayRow(obj, phaseMap[obj.id], isLocked = false, isPast = true, themeController) }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
+                    if (currentObjs.isNotEmpty()) {
+                        PipText("--- CURRENT PHASE ---", themeController, fontSize = 12.sp, textColorOverride = Color.Black, modifier = Modifier.background(themeController.activeColor).padding(horizontal = 4.dp))
+                        currentObjs.forEach { obj ->
+                            // THE FIX: This is the ONLY currentObjs block now, and it includes the delete command!
+                            ObjectiveDisplayRow(obj, phaseMap[obj.id], isLocked = false, isPast = false, themeController) {
+                                QuestEngine.removeObjective(questId, obj.id)
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
+                    if (futureObjs.isNotEmpty()) {
+                        PipText("--- FUTURE OBJECTIVES ---", themeController, fontSize = 12.sp, modifier = Modifier.alpha(0.5f))
+                        futureObjs.forEach { obj ->
+                            // Optional: If you want to delete locked future objectives too, you can add the same { QuestEngine.removeObjective... } lambda to the end of this row!
+                            ObjectiveDisplayRow(obj, phaseMap[obj.id], isLocked = true, isPast = false, themeController) {
+                                QuestEngine.removeObjective(questId, obj.id)
+                            }
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
+                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(themeController.activeColor.copy(alpha = 0.5f)))
+                    Spacer(Modifier.height(16.dp))
+                }
+
                 PipPicker(title = "OBJECTIVE CLASSIFICATION:", options = objTypes, selectedIndex = selectedTypeIndex, themeController = themeController, onOptionSelected = { selectedTypeIndex = it })
                 Spacer(Modifier.height(16.dp))
 
-                // THE FIX: Hide 'Objective Text' entirely if it is a Timed Wait!
                 if (selectedTypeIndex != 1) {
                     BasicTextField(value = text, onValueChange = { text = it }, textStyle = TextStyle(color = themeController.activeColor, fontSize = 16.sp), cursorBrush = SolidColor(themeController.activeColor), modifier = Modifier.fillMaxWidth().background(themeController.activeColor.copy(alpha = 0.1f)).padding(8.dp), decorationBox = { inner -> if (text.isEmpty()) PipText("OBJECTIVE TEXT...", themeController, modifier = Modifier.alpha(0.5f)) else inner() })
                 }
 
-                // CONDITIONAL UI: COLLECTION (Index 2)
                 if (selectedTypeIndex == 2) {
                     Spacer(Modifier.height(8.dp))
                     BasicTextField(value = targetAmount, onValueChange = { targetAmount = it.filter { char -> char.isDigit() || char == '.' } }, textStyle = TextStyle(color = themeController.activeColor, fontSize = 16.sp), cursorBrush = SolidColor(themeController.activeColor), modifier = Modifier.fillMaxWidth().background(themeController.activeColor.copy(alpha = 0.1f)).padding(8.dp), decorationBox = { inner -> if (targetAmount.isEmpty()) PipText("TARGET AMOUNT (e.g. 5000)...", themeController, modifier = Modifier.alpha(0.5f)) else inner() })
-
-                    // THE NEW CURRENCY TOGGLE!
                     Spacer(Modifier.height(8.dp))
                     PipText(if (isCurrency) "[☑] FORMAT AS CURRENCY" else "[ ] FORMAT AS CURRENCY", themeController, fontSize = 12.sp, modifier = Modifier.clickable { isCurrency = !isCurrency })
                 }
 
-                // CONDITIONAL UI: TIMED WAIT (Index 1)
                 if (selectedTypeIndex == 1) {
                     Spacer(Modifier.height(8.dp))
                     Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -435,35 +584,34 @@ fun AddObjectiveTerminal(themeController: ThemeController, onCancel: () -> Unit,
 
                 Spacer(Modifier.height(16.dp))
                 PipText("[ QUEUE OBJECTIVE ]", themeController, modifier = Modifier.align(Alignment.End).clickable {
-                    // Pulls the text from either box depending on the type!
                     val activeText = if (selectedTypeIndex == 1) postWaitText else text
-
                     if (activeText.isNotBlank()) {
                         val type = ObjectiveType.values()[selectedTypeIndex]
-                        val amount = targetAmount.toFloatOrNull()
                         val msMultiplier = when(timeUnits[timeUnitIndex]) { "MINUTES" -> 60000L; "HOURS" -> 3600000L; "DAYS" -> 86400000L; else -> 0L }
                         val durationMs = (waitTime.toLongOrNull() ?: 0L) * msMultiplier
-
-                        queued.add(Objective(text = activeText, type = type, targetAmount = amount, waitDurationMs = if (durationMs > 0) durationMs else null, postWaitText = postWaitText.ifBlank { null }))
+                        queued.add(Objective(text = activeText, type = type, targetAmount = targetAmount.toFloatOrNull(), isCurrency = isCurrency, waitDurationMs = if (durationMs > 0) durationMs else null, postWaitText = postWaitText.ifBlank { null }, waitForPrevious = waitForPrevious, isOptional = isOptional))
                         text = ""; targetAmount = ""; waitTime = ""; postWaitText = ""
                     }
                 })
 
+                // DRAWS THE QUEUE USING THE NEW IMMERSIVE ICONS
                 if (queued.isNotEmpty()) {
                     Spacer(Modifier.height(8.dp))
-                    queued.forEach { obj -> PipText("> ${obj.text} [${obj.type.name}]", themeController, fontSize = 12.sp) }
+                    PipText("--- PENDING QUEUE ---", themeController, fontSize = 12.sp, modifier = Modifier.alpha(0.8f))
+                    queued.forEach { obj ->
+                        ObjectiveDisplayRow(obj, phaseMap[obj.id], isLocked = false, isPast = false, themeController) {
+                            queued.remove(obj) // Instantly deletes from the draft queue!
+                        }
+                    }
                 }
 
                 Spacer(Modifier.height(24.dp))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-
-                    // THE NEW SEQUENTIAL TOGGLE
-                    PipText(
-                        text = if (waitForPrevious) "[☑] WAIT FOR PREVIOUS STEP" else "[ ] SHOW IMMEDIATELY",
-                        themeController = themeController,
-                        fontSize = 12.sp,
-                        modifier = Modifier.clickable { waitForPrevious = !waitForPrevious }
-                    )
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                    Column {
+                        PipText(if (isOptional) "[☑] OPTIONAL DIRECTIVE" else "[ ] OPTIONAL DIRECTIVE", themeController, fontSize = 12.sp, modifier = Modifier.clickable { isOptional = !isOptional })
+                        Spacer(Modifier.height(8.dp))
+                        PipText(text = if (combinedList.isEmpty()) "[☑] INITIAL PHASE (PHASE 1)" else if (waitForPrevious) "[☑] START NEW PHASE (PHASE $pendingPhaseNum)" else "[ ] ADD TO CURRENT PHASE (PHASE $pendingPhaseNum)", themeController = themeController, fontSize = 12.sp, modifier = Modifier.clickable { if (combinedList.isNotEmpty()) waitForPrevious = !waitForPrevious })
+                    }
 
                     Row {
                         PipText("[ CANCEL ]", themeController, modifier = Modifier.clickable { onCancel() }.padding(8.dp))
@@ -471,24 +619,72 @@ fun AddObjectiveTerminal(themeController: ThemeController, onCancel: () -> Unit,
                         PipText("[ APPEND ]", themeController, textColorOverride = Color.Black, modifier = Modifier.background(themeController.activeColor).clickable {
                             val finalQueued = queued.toMutableList()
                             val activeText = if (selectedTypeIndex == 1) postWaitText else text
-
                             if (activeText.isNotBlank()) {
                                 val type = ObjectiveType.values()[selectedTypeIndex]
                                 val msMultiplier = when(timeUnits[timeUnitIndex]) { "MINUTES" -> 60000L; "HOURS" -> 3600000L; "DAYS" -> 86400000L; else -> 0L }
                                 val durationMs = (waitTime.toLongOrNull() ?: 0L) * msMultiplier
-
-                                // Make sure you pass the new boolean into the Objective!
-                                finalQueued.add(Objective(text = activeText, type = type, targetAmount = targetAmount.toFloatOrNull(), isCurrency = isCurrency, waitDurationMs = if (durationMs > 0) durationMs else null, postWaitText = postWaitText.ifBlank { null }, waitForPrevious = waitForPrevious))
+                                finalQueued.add(Objective(text = activeText, type = type, targetAmount = targetAmount.toFloatOrNull(), isCurrency = isCurrency, waitDurationMs = if (durationMs > 0) durationMs else null, postWaitText = postWaitText.ifBlank { null }, waitForPrevious = waitForPrevious, isOptional = isOptional))
                             }
                             if (finalQueued.isNotEmpty()) onSave(finalQueued)
                         }.padding(8.dp))
                     }
                 }
-
             }
         }
     }
 }
+
+@Composable
+fun ObjectiveDisplayRow(obj: Objective, phaseNum: Int?, isLocked: Boolean, isPast: Boolean, themeController: ThemeController, onDelete: (() -> Unit)? = null) {
+    val opt = if (obj.isOptional) "[OPTIONAL] " else ""
+
+    // We split the alpha so the text fades, but the icons and [X] stay bright!
+    val textAlpha = if (isLocked) 0.3f else if (isPast) 0.5f else 1.0f
+    val iconAlpha = if (isLocked) 0.3f else 1.0f // Checkmarks and icons stay at 100%
+
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+
+            // 1. Draws the Checkmark OR the Lock Icon!
+            if (isLocked) {
+                androidx.compose.material3.Icon(
+                    imageVector = androidx.compose.material.icons.Icons.Filled.Lock,
+                    contentDescription = "Locked",
+                    tint = themeController.activeColor,
+                    modifier = Modifier.size(14.dp).alpha(iconAlpha)
+                )
+                Spacer(Modifier.width(6.dp)) // Adds a small gap after the lock
+            } else {
+                val checkText = if (isPast) "[X]" else "[ ]"
+                PipText("$checkText ", themeController, fontSize = 12.sp, modifier = Modifier.alpha(iconAlpha))
+            }
+
+            // 2. Draws the Objective Text (Dimmed if past)
+            PipText("[PHASE $phaseNum] $opt${obj.text}", themeController, fontSize = 12.sp, modifier = Modifier.alpha(textAlpha))
+
+            // 3. Draws the Type Icons (Bright)
+            if (obj.type == ObjectiveType.TIMED_WAIT) {
+                Spacer(Modifier.width(8.dp))
+                androidx.compose.material3.Icon(imageVector = androidx.compose.material.icons.Icons.Filled.Notifications, contentDescription = "Timer", tint = themeController.activeColor, modifier = Modifier.size(14.dp).alpha(iconAlpha))
+            } else if (obj.type == ObjectiveType.COLLECTION) {
+                Spacer(Modifier.width(8.dp))
+                androidx.compose.material3.Icon(imageVector = androidx.compose.material.icons.Icons.Filled.ShoppingCart, contentDescription = "Collection", tint = themeController.activeColor, modifier = Modifier.size(14.dp).alpha(iconAlpha))
+            }
+        }
+
+        // THE DELETE BUTTON (Now a gorgeous red trash can!)
+        if (onDelete != null) {
+            androidx.compose.material3.Icon(
+                imageVector = androidx.compose.material.icons.Icons.Filled.Delete,
+                contentDescription = "Delete",
+                tint = Color.Red,
+                modifier = Modifier.size(16.dp).clickable { onDelete() }
+            )
+        }
+    }
+}
+
 
 // --- NEW COLLECTION TERMINAL ---
 @Composable
@@ -547,4 +743,21 @@ fun formatCollectionAmount(value: Float, isCurrency: Boolean): String {
         // If it's a perfectly clean number (like 5.0), drop the decimal entirely!
         if (value % 1.0f == 0f) value.toLong().toString() else value.toString()
     }
+}
+
+@Composable
+fun SyncButton(themeController: ThemeController) {
+    // We observe the state
+    val bridge = AuthHolder.bridge.value
+
+    PipText(
+        text = if (bridge != null) "[ SYNC GOOGLE CALENDAR ]" else "[ LOADING... ]",
+        themeController = themeController,
+        modifier = Modifier.clickable {
+            // Only call if not null
+            bridge?.startSignIn { success ->
+                println("Sync result: $success")
+            }
+        }
+    )
 }

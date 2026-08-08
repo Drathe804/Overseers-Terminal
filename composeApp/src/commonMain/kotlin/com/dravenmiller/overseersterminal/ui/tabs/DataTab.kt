@@ -17,6 +17,8 @@ import kotlinx.coroutines.launch
 import androidx.compose.material3.ScrollableTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.ui.unit.sp
+import com.dravenmiller.overseersterminal.AuthHolder
+import com.dravenmiller.overseersterminal.createGoogleAuthBridge
 
 enum class DataSubTab { QUESTS, WORKSHOPS, STATS }
 

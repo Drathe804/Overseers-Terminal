@@ -1,5 +1,6 @@
 package com.dravenmiller.overseersterminal.components
 
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateListOf
 import kotlin.random.Random
 import kotlin.math.abs
@@ -7,6 +8,8 @@ import kotlin.math.abs
 enum class QuestCategory { MAIN, SIDE, RADIANT, GOALS }
 
 enum class ObjectiveType { STANDARD, TIMED_WAIT, COLLECTION }
+
+expect @Composable fun RequestRuntimePermissions()
 
 data class Objective(
     val id: String = "OBJ_${kotlin.random.Random.nextInt(100000, 999999)}",
@@ -26,7 +29,8 @@ data class Objective(
     var waitStartTimeMs: Long? = null,
     val postWaitText: String? = null,
 
-    val waitForPrevious: Boolean = true
+    val waitForPrevious: Boolean = true,
+    val isOptional: Boolean = false
 )
 
 data class Quest(
@@ -49,71 +53,41 @@ object QuestEngine {
     val savedTemplates = mutableStateListOf<Quest>()
     val knownLocations = listOf("ANY", "Vault 111 (Fenway)", "Sedalia Outpost", "Supermarket", "Gym", "Dentist")
 
-    fun createNewQuest(title: String, category: QuestCategory, objectives: List<Objective>, repeatInterval: String?, saveAsTemplate: Boolean) {
-        val processedObjectives = objectives.toMutableList()
-        // If the very first objective is a Timer, start it instantly!
-        if (processedObjectives.isNotEmpty() && processedObjectives[0].type == ObjectiveType.TIMED_WAIT) {
-            processedObjectives[0] = processedObjectives[0].copy(waitStartTimeMs = getSystemEpochMillis())
-        }
+    // THE FIX: Removed the objective list requirement, and made it return the String ID!
+    fun createNewQuest(title: String, category: QuestCategory, repeatInterval: String?, saveAsTemplate: Boolean, isSequential: Boolean): String {
+        val newQuestId = "Q_${kotlin.random.Random.nextInt(100000, 999999)}"
 
-        val newQuest = Quest("Q_${Random.nextInt(100000, 999999)}", title, category, processedObjectives, false, true, repeatInterval)
+        val newQuest = Quest(
+            id = newQuestId,
+            title = title,
+            category = category,
+            objectives = mutableListOf(), // Starts completely empty!
+            isComplete = false,
+            isActive = true,
+            repeatInterval = repeatInterval,
+            spawnTimeMs = getSystemEpochMillis()
+        )
+
         activeQuests.add(0, newQuest)
-        if (saveAsTemplate) savedTemplates.add(newQuest.copy(id = "T_${Random.nextInt(100000, 999999)}"))
+        if (saveAsTemplate) savedTemplates.add(newQuest.copy(id = "T_${kotlin.random.Random.nextInt(100000, 999999)}"))
+
+        return newQuestId // Passes the ID back to the UI!
     }
 
-    fun addObjectives(questId: String, newObjectives: List<Objective>) {
-        val index = activeQuests.indexOfFirst { it.id == questId }
-        if (index != -1) {
-            val updated = activeQuests[index].objectives.toMutableList()
 
-            // THE FIX: Check if we are currently completely caught up on this quest!
-            val allPreviousComplete = updated.all { it.isComplete }
-            val processedNew = newObjectives.toMutableList()
-
-            // If we are caught up, and the very first thing we append is a timer, start it instantly!
-            if (allPreviousComplete && processedNew.isNotEmpty() && processedNew[0].type == ObjectiveType.TIMED_WAIT) {
-                processedNew[0] = processedNew[0].copy(waitStartTimeMs = getSystemEpochMillis())
-            }
-
-            updated.addAll(processedNew)
-            activeQuests[index] = activeQuests[index].copy(objectives = updated)
-        }
-    }
-
-    // --- NEW: THE SEQUENTIAL CHAIN LOGIC ---
     fun toggleObjective(questId: String, objIndex: Int): Boolean {
         val qIdx = activeQuests.indexOfFirst { it.id == questId }
         if (qIdx == -1) return false
         val quest = activeQuests[qIdx]
         val updatedObjs = quest.objectives.toMutableList()
 
-        val isNowComplete = !updatedObjs[objIndex].isComplete
-        updatedObjs[objIndex] = updatedObjs[objIndex].copy(isComplete = isNowComplete)
+        updatedObjs[objIndex] = updatedObjs[objIndex].copy(isComplete = !updatedObjs[objIndex].isComplete)
 
-        // If we just completed this step, unlock the next one!
-        if (isNowComplete && objIndex + 1 < updatedObjs.size) {
-            val nextObj = updatedObjs[objIndex + 1]
-            if (nextObj.type == ObjectiveType.TIMED_WAIT && nextObj.waitStartTimeMs == null) {
-                updatedObjs[objIndex + 1] = nextObj.copy(waitStartTimeMs = getSystemEpochMillis())
-
-                // --- THE NEW NOTIFICATION TRIGGER ---
-                if (nextObj.waitDurationMs != null && nextObj.waitDurationMs > 0) {
-                    val safeId = kotlin.random.Random.nextInt(1, 9999)
-                    scheduleObjectiveNotification(
-                        id = safeId,
-                        title = "PIP-BOY DIRECTIVE UPDATE",
-                        message = nextObj.postWaitText ?: "Timer Complete!",
-                        delayMs = nextObj.waitDurationMs
-                    )
-                }
-            }
-        }
-
+        updatePhasesAndTimers(updatedObjs) // Automatically handles the next phases!
         activeQuests[qIdx] = quest.copy(objectives = updatedObjs)
-        return isNowComplete && updatedObjs.all { it.isComplete } // Returns true if Quest is finished!
+        return updatedObjs.filter { !it.isOptional }.all { it.isComplete }
     }
 
-    // --- NEW: THE COLLECTION BANK LOGIC ---
     fun addFundsToObjective(questId: String, objIndex: Int, amount: Float): Boolean {
         val qIdx = activeQuests.indexOfFirst { it.id == questId }
         if (qIdx == -1) return false
@@ -123,21 +97,36 @@ object QuestEngine {
 
         val newAmount = obj.currentAmount + amount
         var isNowComplete = obj.isComplete
-
-        if (obj.targetAmount != null && newAmount >= obj.targetAmount) {
-            isNowComplete = true
-            // Unlock next step!
-            if (objIndex + 1 < updatedObjs.size) {
-                val nextObj = updatedObjs[objIndex + 1]
-                if (nextObj.type == ObjectiveType.TIMED_WAIT && nextObj.waitStartTimeMs == null) {
-                    updatedObjs[objIndex + 1] = nextObj.copy(waitStartTimeMs = getSystemEpochMillis())
-                }
-            }
-        }
+        if (obj.targetAmount != null && newAmount >= obj.targetAmount) isNowComplete = true
 
         updatedObjs[objIndex] = obj.copy(currentAmount = newAmount, isComplete = isNowComplete)
+
+        updatePhasesAndTimers(updatedObjs) // Automatically handles the next phases!
         activeQuests[qIdx] = quest.copy(objectives = updatedObjs)
-        return isNowComplete && updatedObjs.all { it.isComplete }
+        return updatedObjs.all { it.isComplete }
+    }
+
+    fun addObjectives(questId: String, newObjectives: List<Objective>) {
+        val index = activeQuests.indexOfFirst { it.id == questId }
+        if (index != -1) {
+            val updated = activeQuests[index].objectives.toMutableList()
+            updated.addAll(newObjectives)
+
+            updatePhasesAndTimers(updated) // Check if the new items need timers started!
+            activeQuests[index] = activeQuests[index].copy(objectives = updated)
+        }
+    }
+
+    fun removeObjective(questId: String, objectiveId: String) {
+        val qIdx = activeQuests.indexOfFirst { it.id == questId }
+        if (qIdx != -1) {
+            val quest = activeQuests[qIdx]
+            // Filters out the deleted objective
+            val updatedObjs = quest.objectives.filter { it.id != objectiveId }.toMutableList()
+
+            updatePhasesAndTimers(updatedObjs) // Recalculate phases in case a blocker was deleted!
+            activeQuests[qIdx] = quest.copy(objectives = updatedObjs)
+        }
     }
 
     fun completeQuest(questId: String) {
@@ -178,10 +167,45 @@ object QuestEngine {
         }
     }
 
+    // --- THE NEW PHASE SCANNER ---
+    // This evaluates the entire quest to find active phases and trigger unlocked timers!
+    private fun updatePhasesAndTimers(objectives: MutableList<Objective>) {
+        var hideRemaining = false
+        var groupIncomplete = false
+
+        for (i in objectives.indices) {
+            val o = objectives[i]
+
+            // If this item is told to wait, and the previous group isn't done yet, trip the wire!
+            if (o.waitForPrevious) {
+                if (groupIncomplete) hideRemaining = true
+                groupIncomplete = false // Reset for the new phase
+            }
+
+
+            // If we are in the active phase, evaluate it!
+            if (!hideRemaining) {
+                if (!o.isComplete && !o.isOptional) {
+                    groupIncomplete = true
+
+                    // If it's a timer that just got unlocked, START IT!
+                    if (o.type == ObjectiveType.TIMED_WAIT && o.waitStartTimeMs == null) {
+                        objectives[i] = o.copy(waitStartTimeMs = getSystemEpochMillis())
+                        if (o.waitDurationMs != null && o.waitDurationMs > 0) {
+                            val safeId = kotlin.random.Random.nextInt(1, 9999)
+                            scheduleObjectiveNotification(safeId, "PIP-BOY DIRECTIVE UPDATE", o.postWaitText ?: "Timer Complete!", o.waitDurationMs)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
 
 
-// ==========================================
+
+
+    // ==========================================
     // THE GEOFENCE & TIME-FENCE ENGINE
     // ==========================================
     fun evaluateTriggers(currentLocation: String, currentTime: String) {
